@@ -276,8 +276,24 @@ def render_bilingual(
     bottom_logo_pad = 42.0  # reduced from 62 to push text lower
 
     zh_area_h = 36.0   # main Chinese translation
-    gap = 1.0
-    note_area_h = 12.0  # optional note (slightly larger)
+    zh_note_gap = 2.0   # gap between zh and note (reduced from implicit large gap)
+    note_area_h = 18.0  # optional note area (increased for longer notes)
+    line_height = 1.15  # line spacing multiplier (slightly increased from default)
+    
+    # Maximum upward shift to avoid overflow (in points)
+    max_upshift = 20.0
+    upshift_step = 4.0
+    
+    def estimate_text_height(text: str, rect_width: float, fontsize: float) -> float:
+        """Estimate text height based on character count and rect width."""
+        if not text:
+            return 0.0
+        # Rough estimate: CJK chars ~= fontsize width, assume ~1.2x line height
+        chars_per_line = max(1, int(rect_width / (fontsize * 0.9)))
+        num_lines = (len(text) + chars_per_line - 1) // chars_per_line
+        # Account for explicit newlines
+        num_lines += text.count('\n')
+        return num_lines * fontsize * 1.3
 
     for pno in range(len(doc)):
         page = doc[pno]
@@ -297,28 +313,49 @@ def render_bilingual(
 
                 # Text box anchored above the logo area, near the lower part of the card.
                 content_bottom = y1 - bottom_logo_pad
+                rect_width = (x1 - inset_x) - (x0 + inset_x)
+                
+                # Calculate upshift needed based on text length estimation
+                upshift = 0.0
+                
+                if note:
+                    note_text = note if note.startswith("注：") or note.startswith("注:") else "注：" + note
+                    est_note_h = estimate_text_height(note_text, rect_width, note_fontsize)
+                    est_zh_h = estimate_text_height(zh, rect_width, zh_fontsize) if zh else 0
+                    
+                    # Check if estimated heights exceed allocated space
+                    if est_note_h > note_area_h:
+                        upshift = min(est_note_h - note_area_h + upshift_step, max_upshift)
+                    if est_zh_h > zh_area_h:
+                        upshift = min(max(upshift, est_zh_h - zh_area_h + upshift_step), max_upshift)
+                else:
+                    est_zh_h = estimate_text_height(zh, rect_width, zh_fontsize) if zh else 0
+                    if est_zh_h > zh_area_h:
+                        upshift = min(est_zh_h - zh_area_h + upshift_step, max_upshift)
+                
+                adjusted_bottom = content_bottom - upshift
 
                 if note:
-                    # Both zh and note: place note at bottom, zh above it with minimal gap
+                    # Both zh and note: place note at bottom, zh directly above with small gap
                     note_rect = fitz.Rect(
                         x0 + inset_x,
-                        content_bottom - note_area_h,
+                        adjusted_bottom - note_area_h,
                         x1 - inset_x,
-                        content_bottom,
+                        adjusted_bottom,
                     )
                     zh_rect = fitz.Rect(
                         x0 + inset_x,
-                        content_bottom - note_area_h - zh_area_h,  # removed gap
+                        adjusted_bottom - note_area_h - zh_note_gap - zh_area_h,
                         x1 - inset_x,
-                        content_bottom - note_area_h,
+                        adjusted_bottom - note_area_h - zh_note_gap,
                     )
                 else:
-                    # No note: place zh at the very bottom (in note's position)
+                    # No note: place zh at the very bottom
                     zh_rect = fitz.Rect(
                         x0 + inset_x,
-                        content_bottom - zh_area_h,
+                        adjusted_bottom - zh_area_h,
                         x1 - inset_x,
-                        content_bottom,
+                        adjusted_bottom,
                     )
                     note_rect = None
 
@@ -331,17 +368,18 @@ def render_bilingual(
                         fontfile=font_path,
                         fontsize=zh_fontsize,
                         align=0,  # left
+                        lineheight=line_height,
                     )
                     if rc < 0:
-                        print(f"[WARN] zh overflow: {cid}", file=sys.stderr)
+                        if upshift > 0:
+                            print(f"[WARN] zh overflow: {cid} (even with {upshift:.1f}pt upshift)", file=sys.stderr)
+                        else:
+                            print(f"[WARN] zh overflow: {cid}", file=sys.stderr)
+                    elif upshift > 0:
+                        print(f"[INFO] {cid}: shifted up by {upshift:.1f}pt", file=sys.stderr)
 
                 # Insert note
                 if note and note_rect:
-                    # Only add "注：" prefix if note doesn't already start with it
-                    if note.startswith("注：") or note.startswith("注:"):
-                        note_text = note
-                    else:
-                        note_text = "注：" + note
                     rc = page.insert_textbox(
                         note_rect,
                         note_text,
@@ -349,6 +387,7 @@ def render_bilingual(
                         fontfile=font_path,
                         fontsize=note_fontsize,
                         align=0,
+                        lineheight=line_height,
                     )
                     if rc < 0:
                         print(f"[WARN] note overflow: {cid}", file=sys.stderr)
