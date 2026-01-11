@@ -206,15 +206,15 @@ def write_csv(cards: List[Card], out_csv: str) -> None:
 def _find_default_cjk_font() -> Optional[str]:
     """
     Best-effort font discovery for Windows/macOS/Linux. Users can (and should) pass --font explicitly.
+    SimHei (黑体) is preferred for its bolder weight.
     """
     candidates = []
     if sys.platform.startswith("win"):
         win = os.environ.get("WINDIR", r"C:\Windows")
         candidates += [
-            os.path.join(win, "Fonts", "simhei.ttf"),  # 黑体
-            os.path.join(win, "Fonts", "msyh.ttc"),    # 微软雅黑
-            os.path.join(win, "Fonts", "msyh.ttf"),
-            os.path.join(win, "Fonts", "simfang.ttf"),
+            os.path.join(win, "Fonts", "simhei.ttf"),  # 黑体 (推荐，较粗)
+            os.path.join(win, "Fonts", "NotoSansSC-VF.ttf"),  # Noto Sans SC
+            os.path.join(win, "Fonts", "simfang.ttf"),  # 仿宋
         ]
     else:
         candidates += [
@@ -255,7 +255,7 @@ def render_bilingual(
 
     # Read translations
     rows: Dict[str, Tuple[str, str]] = {}
-    with open(csv_in, "r", encoding="utf-8", newline="") as f:
+    with open(csv_in, "r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
         for r in reader:
             cid = (r.get("card_id") or "").strip()
@@ -277,11 +277,11 @@ def render_bilingual(
 
     zh_area_h = 36.0   # main Chinese translation
     zh_note_gap = 2.0   # gap between zh and note (reduced from implicit large gap)
-    note_area_h = 18.0  # optional note area (increased for longer notes)
-    line_height = 1.15  # line spacing multiplier (slightly increased from default)
+    note_area_h = 26.0  # optional note area (increased for longer notes)
+    line_height = 1.35  # line spacing multiplier
     
     # Maximum upward shift to avoid overflow (in points)
-    max_upshift = 20.0
+    max_upshift = 28.0
     upshift_step = 4.0
     
     def estimate_text_height(text: str, rect_width: float, fontsize: float) -> float:
@@ -392,7 +392,13 @@ def render_bilingual(
                     if rc < 0:
                         print(f"[WARN] note overflow: {cid}", file=sys.stderr)
 
-    doc.save(pdf_out)
+    # Save with compression and garbage collection to reduce file size
+    doc.save(
+        pdf_out,
+        garbage=4,  # Maximum garbage collection
+        deflate=True,  # Compress streams
+        clean=True,  # Clean content streams
+    )
     doc.close()
 
 
