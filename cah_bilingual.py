@@ -273,11 +273,11 @@ def render_bilingual(
     # Leave room at bottom for the CAH logo.
     inset_x = 12.0
     inset_top = 32.0
-    bottom_logo_pad = 62.0
+    bottom_logo_pad = 42.0  # reduced from 62 to push text lower
 
     zh_area_h = 36.0   # main Chinese translation
     gap = 1.0
-    note_area_h = 10.0  # optional note
+    note_area_h = 12.0  # optional note (slightly larger)
 
     for pno in range(len(doc)):
         page = doc[pno]
@@ -296,20 +296,31 @@ def render_bilingual(
                 y1 = y0 + card_h
 
                 # Text box anchored above the logo area, near the lower part of the card.
-                # We'll place note below zh if present.
                 content_bottom = y1 - bottom_logo_pad
-                note_rect = fitz.Rect(
-                    x0 + inset_x,
-                    content_bottom - note_area_h,
-                    x1 - inset_x,
-                    content_bottom,
-                )
-                zh_rect = fitz.Rect(
-                    x0 + inset_x,
-                    content_bottom - note_area_h - gap - zh_area_h,
-                    x1 - inset_x,
-                    content_bottom - note_area_h - gap,
-                )
+
+                if note:
+                    # Both zh and note: place note at bottom, zh above it with minimal gap
+                    note_rect = fitz.Rect(
+                        x0 + inset_x,
+                        content_bottom - note_area_h,
+                        x1 - inset_x,
+                        content_bottom,
+                    )
+                    zh_rect = fitz.Rect(
+                        x0 + inset_x,
+                        content_bottom - note_area_h - zh_area_h,  # removed gap
+                        x1 - inset_x,
+                        content_bottom - note_area_h,
+                    )
+                else:
+                    # No note: place zh at the very bottom (in note's position)
+                    zh_rect = fitz.Rect(
+                        x0 + inset_x,
+                        content_bottom - zh_area_h,
+                        x1 - inset_x,
+                        content_bottom,
+                    )
+                    note_rect = None
 
                 # Insert main zh
                 if zh:
@@ -325,8 +336,12 @@ def render_bilingual(
                         print(f"[WARN] zh overflow: {cid}", file=sys.stderr)
 
                 # Insert note
-                if note:
-                    note_text = "注：" + note
+                if note and note_rect:
+                    # Only add "注：" prefix if note doesn't already start with it
+                    if note.startswith("注：") or note.startswith("注:"):
+                        note_text = note
+                    else:
+                        note_text = "注：" + note
                     rc = page.insert_textbox(
                         note_rect,
                         note_text,
