@@ -1,286 +1,401 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 cah_bilingual.py
-Make bilingual Cards Against Humanity-style PDFs by adding Chinese text onto the existing card PDF.
 
-Workflow:
-  1) Extract card texts (English) to CSV:
-       python cah_bilingual.py extract --pdf cah-black.pdf --out cards.csv
-  2) Fill in 'zh' and optionally 'note' columns in the CSV.
-  3) Render a new bilingual PDF (non-destructive: writes a new file):
-       python cah_bilingual.py render --pdf cah-black.pdf --csv cards.csv --out cah-black-bilingual.pdf
+Utilities to:
+1) Extract each black card's English text from a 3x3-per-page CAH-style PDF into CSV.
+2) Render Chinese (and optional notes) back into the original PDF in a fixed textbox per card.
 
-Notes:
-  - This script assumes the PDF is a 3x3 grid per page (like your cah-black.pdf example).
-  - It preserves the original layout and only adds text.
-  - Chinese text is inserted using PyMuPDF (fitz) with an embedded font file (recommended).
+Key fix:
+- Extraction uses word-level geometry (page.get_text("words")) instead of blocks, because some PDFs
+  place multiple cards' text into a single "block" spanning multiple columns. Word geometry lets us
+  correctly split text into the right card cell.
+
+Dependencies:
+  pip install pymupdf
 """
+
+from __future__ import annotations
 
 import argparse
 import csv
 import os
 import re
+import sys
+import statistics
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
 
 
-# --- Layout constants for cah-black.pdf (Letter, 3x3 grid) ---
-CARD_W = 180.0
-CARD_H = 248.4
-LEFT_MARGIN = 36.0
-TOP_MARGIN = 24.0  # from top edge downward
+GRID_ROWS = 3
+GRID_COLS = 3
+
+# These values match the provided cah-black.pdf (Letter: 612 x 792 points, 3x3 grid)
+DEFAULT_LEFT_MARGIN = 36.0
+DEFAULT_TOP_MARGIN = 24.0
+DEFAULT_CARD_W = 180.0
+DEFAULT_CARD_H = 248.4
+
+MIDDOT_RE = re.compile(r"[·•・]")
 
 
 @dataclass
 class Card:
     card_id: str
-    page: int
+    page: int  # 1-based
     row: int
     col: int
     en: str
 
 
-def _normalize_text(s: str) -> str:
-    s = (s or "").replace("\u00ad", "")  # soft hyphen
-    s = re.sub(r"\s+\n", "\n", s)
-    s = re.sub(r"\n\s+", "\n", s)
-    s = re.sub(r"[ \t]+", " ", s)
-    return s.strip()
+def _replace_mid_dot(s: str) -> str:
+    """Avoid CJK middle dot glyph issues by normalizing to ASCII dot."""
+    return MIDDOT_RE.sub(".", s)
 
 
-def _normalize_cn(s: str) -> str:
+def _card_id(page_1based: int, row: int, col: int) -> str:
+    return f"p{page_1based:02d}_r{row}_c{col}"
+
+
+def _assign_cell(
+    x_center: float,
+    y_center: float,
+    left_margin: float,
+    top_margin: float,
+    card_w: float,
+    card_h: float,
+) -> Optional[Tuple[int, int]]:
     """
-    CN normalization:
-      - remove optional leading "中文："/"中文:"
-      - replace middle dots with '.' to avoid missing-glyph issues
+    Given a point (x_center, y_center) in PyMuPDF page coordinates (origin top-left),
+    return (row, col) for 3x3 grid, or None if outside the grid.
     """
-    s = (s or "").strip()
-    s = re.sub(r"^\s*中文[:：]\s*", "", s)
-    # Normalize various middle dot / bullet characters.
-    s = s.replace("·", ".").replace("•", ".").replace("・", ".")
-    return s.strip()
+    relx = x_center - left_margin
+    rely = y_center - top_margin
+    if relx < 0 or relx >= GRID_COLS * card_w:
+        return None
+    if rely < 0 or rely >= GRID_ROWS * card_h:
+        return None
+    col = int(relx // card_w)
+    row = int(rely // card_h)
+    if not (0 <= row < GRID_ROWS and 0 <= col < GRID_COLS):
+        return None
+    return row, col
 
 
-def _card_rect_from_grid_fitz(row: int, col: int) -> fitz.Rect:
+def _join_tokens(tokens: List[str]) -> str:
     """
-    Return card rectangle in PyMuPDF coordinates (origin at top-left).
+    Join English tokens with spacing rules that avoid spaces before common punctuation.
+    (PyMuPDF 'words' usually keeps punctuation attached, but this makes output more stable.)
     """
-    x0 = LEFT_MARGIN + col * CARD_W
-    y0 = TOP_MARGIN + row * CARD_H
-    return fitz.Rect(x0, y0, x0 + CARD_W, y0 + CARD_H)
+    if not tokens:
+        return ""
+    out: List[str] = [tokens[0]]
+    no_space_before = {".", ",", "!", "?", ";", ":", ")", "]", "}"}
+    no_space_after = {"(", "[", "{"}
+
+    for tok in tokens[1:]:
+        prev = out[-1]
+        if tok in no_space_before:
+            out[-1] = prev + tok
+        elif tok.startswith("'") or tok.startswith("’"):
+            out[-1] = prev + tok
+        elif prev and prev[-1] in no_space_after:
+            out[-1] = prev + tok
+        else:
+            out.append(tok)
+    return " ".join(out)
 
 
-def _auto_find_cn_font() -> Optional[str]:
+def _words_to_lines(words: List[Tuple]) -> List[str]:
     """
-    Try to find a usable CJK sans-serif font file on the current machine.
-    Prefer TTF/OTF. TTC may work with PyMuPDF, but availability varies by OS.
+    Convert a list of PyMuPDF 'words' into visual lines using y clustering.
+    Each word tuple is (x0, y0, x1, y1, text, block_no, line_no, word_no).
     """
-    candidates = []
+    if not words:
+        return []
 
-    # Linux (container): Noto Sans CJK is commonly installed as TTC
-    candidates += [
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
-        "/usr/share/fonts/opentype/noto/NotoSansSC-Regular.otf",
-    ]
+    # Sort top-to-bottom, left-to-right.
+    words_sorted = sorted(words, key=lambda w: (w[1], w[0]))
 
-    # Windows
-    candidates += [
-        r"C:\Windows\Fonts\msyh.ttc",     # Microsoft YaHei (TTC)
-        r"C:\Windows\Fonts\msyh.ttf",
-        r"C:\Windows\Fonts\simhei.ttf",   # SimHei (TTF)
-        r"C:\Windows\Fonts\msyhl.ttc",
-    ]
+    heights = [(w[3] - w[1]) for w in words_sorted]
+    med_h = statistics.median(heights) if heights else 10.0
+    # Tolerance: a fraction of font height, but not too small.
+    y_tol = max(2.0, 0.25 * med_h)
 
-    # macOS
-    candidates += [
-        "/System/Library/Fonts/PingFang.ttc",
-        "/System/Library/Fonts/STHeiti Light.ttc",
-        "/Library/Fonts/Arial Unicode.ttf",
-    ]
+    lines: List[List[Tuple]] = []
+    cur: List[Tuple] = []
+    cur_y: Optional[float] = None
 
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-    return None
+    for w in words_sorted:
+        y_center = (w[1] + w[3]) / 2.0
+        if cur_y is None:
+            cur = [w]
+            cur_y = y_center
+            continue
+        if abs(y_center - cur_y) <= y_tol:
+            cur.append(w)
+            # Update running mean for stability.
+            cur_y = (cur_y * (len(cur) - 1) + y_center) / len(cur)
+        else:
+            lines.append(cur)
+            cur = [w]
+            cur_y = y_center
+    if cur:
+        lines.append(cur)
+
+    out_lines: List[str] = []
+    for line in lines:
+        line_sorted = sorted(line, key=lambda w: w[0])
+        toks = [w[4] for w in line_sorted]
+        out_lines.append(_join_tokens(toks).strip())
+    return [ln for ln in out_lines if ln]
 
 
-def extract_cards_to_csv(pdf_path: str, out_csv: str) -> None:
+def extract_cards(
+    pdf_path: str,
+    left_margin: float = DEFAULT_LEFT_MARGIN,
+    top_margin: float = DEFAULT_TOP_MARGIN,
+    card_w: float = DEFAULT_CARD_W,
+    card_h: float = DEFAULT_CARD_H,
+) -> List[Card]:
     """
-    Extract English prompt text per card to CSV.
-    Uses text blocks and clusters them into a 3x3 grid.
+    Extract cards using word-level geometry to avoid multi-card text blocks.
     """
     doc = fitz.open(pdf_path)
     cards: List[Card] = []
 
     for pno in range(len(doc)):
         page = doc[pno]
-        blocks = page.get_text("blocks")
+        words = page.get_text("words")  # per-word boxes
 
-        filtered = []
-        for (x0, y0, x1, y1, text, bno, btype) in blocks:
-            t = _normalize_text(text)
-            if not t:
+        # Group words into 3x3 cells.
+        cell_words: Dict[Tuple[int, int], List[Tuple]] = {(r, c): [] for r in range(GRID_ROWS) for c in range(GRID_COLS)}
+        for w in words:
+            x0, y0, x1, y1, txt, *_ = w
+            if not txt or not txt.strip():
                 continue
-            if "Cards Against Humanity is a trademark" in t:
+            xc = (x0 + x1) / 2.0
+            yc = (y0 + y1) / 2.0
+            cell = _assign_cell(xc, yc, left_margin, top_margin, card_w, card_h)
+            if cell is None:
                 continue
-            filtered.append((x0, y0, x1, y1, t))
+            cell_words[cell].append(w)
 
-        # Sort blocks into reading order
-        filtered.sort(key=lambda b: (round(b[1], 1), round(b[0], 1)))
+        page_1based = pno + 1
+        for r in range(GRID_ROWS):
+            for c in range(GRID_COLS):
+                lines = _words_to_lines(cell_words[(r, c)])
+                en = "\n".join(lines).strip()
+                cards.append(Card(card_id=_card_id(page_1based, r, c), page=page_1based, row=r, col=c, en=en))
 
-        # If the PDF matches expected grid, we can just read each card's main textbox.
-        # However, to stay close to the original demo, we map blocks to a 3x3 grid
-        # using x0/y0 buckets.
-        x0s = [round(b[0], 1) for b in filtered]
-        y0s = [round(b[1], 1) for b in filtered]
+    doc.close()
+    return cards
 
-        def _top3_buckets(vals: List[float]) -> List[float]:
-            freq: Dict[float, int] = {}
-            for v in vals:
-                # bucket in 5-pt bins
-                k = round(v / 5) * 5
-                freq[k] = freq.get(k, 0) + 1
-            tops = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
-            return sorted([k for k, _ in tops])
 
-        x_buckets = _top3_buckets(x0s)
-        y_buckets = _top3_buckets(y0s)
-
-        def _nearest_bucket(v: float, buckets: List[float]) -> int:
-            return min(range(len(buckets)), key=lambda i: abs(v - buckets[i]))
-
-        grid_text = {(r, c): [] for r in range(3) for c in range(3)}
-        for (x0, y0, x1, y1, t) in filtered:
-            r = _nearest_bucket(round(y0 / 5) * 5, y_buckets)
-            c = _nearest_bucket(round(x0 / 5) * 5, x_buckets)
-            grid_text[(r, c)].append(t)
-
-        for r in range(3):
-            for c in range(3):
-                en = "\n".join(grid_text[(r, c)]).strip()
-                if not en:
-                    continue
-                card_id = f"p{pno+1:02d}_r{r}_c{c}"
-                cards.append(Card(card_id=card_id, page=pno + 1, row=r, col=c, en=en))
-
-    with open(out_csv, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
+def write_csv(cards: List[Card], out_csv: str) -> None:
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
         w.writerow(["card_id", "page", "row", "col", "en", "zh", "note"])
         for c in cards:
             w.writerow([c.card_id, c.page, c.row, c.col, c.en, "", ""])
 
 
-def render_bilingual_pdf(pdf_path: str, cards_csv: str, out_pdf: str, fontfile: Optional[str]) -> None:
+def _find_default_cjk_font() -> Optional[str]:
     """
-    Add Chinese text onto the existing PDF and save as a new PDF.
+    Best-effort font discovery for Windows/macOS/Linux. Users can (and should) pass --font explicitly.
     """
-    # Load translations
-    rows: Dict[str, Dict[str, str]] = {}
-    with open(cards_csv, "r", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            rows[row["card_id"]] = row
-
-    # Pick font
-    if fontfile:
-        cn_fontfile = fontfile
+    candidates = []
+    if sys.platform.startswith("win"):
+        win = os.environ.get("WINDIR", r"C:\Windows")
+        candidates += [
+            os.path.join(win, "Fonts", "simhei.ttf"),  # 黑体
+            os.path.join(win, "Fonts", "msyh.ttc"),    # 微软雅黑
+            os.path.join(win, "Fonts", "msyh.ttf"),
+            os.path.join(win, "Fonts", "simfang.ttf"),
+        ]
     else:
-        cn_fontfile = _auto_find_cn_font()
+        candidates += [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/System/Library/Fonts/PingFang.ttc",
+            "/Library/Fonts/Arial Unicode.ttf",
+        ]
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    return None
 
-    if not cn_fontfile:
-        raise RuntimeError(
-            "No CJK font file found. Provide one with --font, e.g. "
-            "Windows: C:\\Windows\\Fonts\\simhei.ttf or msyh.ttc; "
-            "macOS: /System/Library/Fonts/PingFang.ttc; "
-            "Linux: install Noto Sans CJK."
+
+def render_bilingual(
+    pdf_in: str,
+    csv_in: str,
+    pdf_out: str,
+    font_path: Optional[str] = None,
+    left_margin: float = DEFAULT_LEFT_MARGIN,
+    top_margin: float = DEFAULT_TOP_MARGIN,
+    card_w: float = DEFAULT_CARD_W,
+    card_h: float = DEFAULT_CARD_H,
+    zh_fontsize: float = 8.0,
+    note_fontsize: float = 7.0,
+) -> None:
+    """
+    Insert zh/note into the original PDF. Uses fixed-width rectangles per card so text never
+    spills into adjacent cards.
+    """
+    font_path = font_path or _find_default_cjk_font()
+    if not font_path or not os.path.exists(font_path):
+        raise FileNotFoundError(
+            "No CJK font found. Please pass --font with a valid .ttf/.ttc/.otf path "
+            "(e.g., C:\\Windows\\Fonts\\simhei.ttf)."
         )
 
-    doc = fitz.open(pdf_path)
+    # Read translations
+    rows: Dict[str, Tuple[str, str]] = {}
+    with open(csv_in, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            cid = (r.get("card_id") or "").strip()
+            if not cid:
+                continue
+            zh = (r.get("zh") or "").strip()
+            note = (r.get("note") or "").strip()
+            zh = _replace_mid_dot(zh)
+            note = _replace_mid_dot(note)
+            rows[cid] = (zh, note)
+
+    doc = fitz.open(pdf_in)
+
+    # Geometry for text areas inside each card (PyMuPDF coords: origin top-left)
+    # Leave room at bottom for the CAH logo.
+    inset_x = 12.0
+    inset_top = 32.0
+    bottom_logo_pad = 62.0
+
+    zh_area_h = 36.0   # main Chinese translation
+    gap = 1.0
+    note_area_h = 10.0  # optional note
 
     for pno in range(len(doc)):
         page = doc[pno]
-        for r in range(3):
-            for c in range(3):
-                card_id = f"p{pno+1:02d}_r{r}_c{c}"
-                if card_id not in rows:
-                    continue
+        page_1based = pno + 1
 
-                zh = _normalize_cn(rows[card_id].get("zh") or "")
-                note = _normalize_cn(rows[card_id].get("note") or "")
+        for r in range(GRID_ROWS):
+            for c in range(GRID_COLS):
+                cid = _card_id(page_1based, r, c)
+                zh, note = rows.get(cid, ("", ""))
                 if not zh and not note:
                     continue
 
-                card = _card_rect_from_grid_fitz(r, c)
+                x0 = left_margin + c * card_w
+                y0 = top_margin + r * card_h
+                x1 = x0 + card_w
+                y1 = y0 + card_h
 
-                # In-card text boxes (keep clear of the logo area at the bottom)
-                left = card.x0 + 12
-                right = card.x1 - 12
-                bottom_pad = 36.0  # leave space for logo
-                note_h = 22.0
-                zh_h = 44.0
+                # Text box anchored above the logo area, near the lower part of the card.
+                # We'll place note below zh if present.
+                content_bottom = y1 - bottom_logo_pad
+                note_rect = fitz.Rect(
+                    x0 + inset_x,
+                    content_bottom - note_area_h,
+                    x1 - inset_x,
+                    content_bottom,
+                )
+                zh_rect = fitz.Rect(
+                    x0 + inset_x,
+                    content_bottom - note_area_h - gap - zh_area_h,
+                    x1 - inset_x,
+                    content_bottom - note_area_h - gap,
+                )
 
-                note_rect = fitz.Rect(left, card.y1 - bottom_pad - note_h, right, card.y1 - bottom_pad)
-                zh_rect = fitz.Rect(left, note_rect.y0 - zh_h, right, note_rect.y0)
-
-                # Chinese main translation (max space = zh_rect; auto-wrap inside box)
+                # Insert main zh
                 if zh:
-                    ret = page.insert_textbox(
+                    rc = page.insert_textbox(
                         zh_rect,
                         zh,
-                        fontsize=8,
-                        fontname="CNFont",
-                        fontfile=cn_fontfile,
-                        align=0,
+                        fontname="cjk",
+                        fontfile=font_path,
+                        fontsize=zh_fontsize,
+                        align=0,  # left
                     )
-                    if ret < 0:
-                        print(f"[WARN] zh text overflow: {card_id}", file=os.sys.stderr)
+                    if rc < 0:
+                        print(f"[WARN] zh overflow: {cid}", file=sys.stderr)
 
-                # Optional note (smaller)
+                # Insert note
                 if note:
-                    ret2 = page.insert_textbox(
+                    note_text = "注：" + note
+                    rc = page.insert_textbox(
                         note_rect,
-                        "注：" + note,
-                        fontsize=7,
-                        fontname="CNFont",
-                        fontfile=cn_fontfile,
+                        note_text,
+                        fontname="cjk",
+                        fontfile=font_path,
+                        fontsize=note_fontsize,
                         align=0,
                     )
-                    if ret2 < 0:
-                        print(f"[WARN] note text overflow: {card_id}", file=os.sys.stderr)
+                    if rc < 0:
+                        print(f"[WARN] note overflow: {cid}", file=sys.stderr)
 
-    doc.save(out_pdf, garbage=4, deflate=True)
+    doc.save(pdf_out)
+    doc.close()
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    ap_ex = sub.add_parser("extract", help="Extract English card texts to CSV")
+    ap_ex = sub.add_parser("extract", help="Extract English card texts into a CSV.")
     ap_ex.add_argument("--pdf", required=True)
     ap_ex.add_argument("--out", required=True)
+    ap_ex.add_argument("--left", type=float, default=DEFAULT_LEFT_MARGIN)
+    ap_ex.add_argument("--top", type=float, default=DEFAULT_TOP_MARGIN)
+    ap_ex.add_argument("--card_w", type=float, default=DEFAULT_CARD_W)
+    ap_ex.add_argument("--card_h", type=float, default=DEFAULT_CARD_H)
 
-    ap_re = sub.add_parser("render", help="Render bilingual PDF from CSV")
+    ap_re = sub.add_parser("render", help="Insert zh/note into the original PDF.")
     ap_re.add_argument("--pdf", required=True)
     ap_re.add_argument("--csv", required=True)
     ap_re.add_argument("--out", required=True)
-    ap_re.add_argument(
-        "--font",
-        default=None,
-        help="Path to a CJK font file (TTF/OTF recommended; TTC often works). "
-             "If omitted, the script tries to auto-detect a font.",
-    )
+    ap_re.add_argument("--font", default=None, help="Path to a CJK font file (recommended).")
+    ap_re.add_argument("--left", type=float, default=DEFAULT_LEFT_MARGIN)
+    ap_re.add_argument("--top", type=float, default=DEFAULT_TOP_MARGIN)
+    ap_re.add_argument("--card_w", type=float, default=DEFAULT_CARD_W)
+    ap_re.add_argument("--card_h", type=float, default=DEFAULT_CARD_H)
+    ap_re.add_argument("--zh_fontsize", type=float, default=8.0)
+    ap_re.add_argument("--note_fontsize", type=float, default=7.0)
 
     args = ap.parse_args()
 
     if args.cmd == "extract":
-        extract_cards_to_csv(args.pdf, args.out)
+        cards = extract_cards(
+            args.pdf,
+            left_margin=args.left,
+            top_margin=args.top,
+            card_w=args.card_w,
+            card_h=args.card_h,
+        )
+        write_csv(cards, args.out)
+        print(f"Wrote {len(cards)} cards to {args.out}")
+
     elif args.cmd == "render":
-        render_bilingual_pdf(args.pdf, args.csv, args.out, args.font)
+        render_bilingual(
+            args.pdf,
+            args.csv,
+            args.out,
+            font_path=args.font,
+            left_margin=args.left,
+            top_margin=args.top,
+            card_w=args.card_w,
+            card_h=args.card_h,
+            zh_fontsize=args.zh_fontsize,
+            note_fontsize=args.note_fontsize,
+        )
+        print(f"Wrote bilingual PDF to {args.out}")
+
     else:
-        raise SystemExit(2)
+        raise SystemExit("Unknown command")
 
 
 if __name__ == "__main__":
